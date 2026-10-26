@@ -20,7 +20,9 @@ use crate::colr::{convert_bounding_box, get_colr_info};
 use crate::kurbo::Point;
 use crate::kurbo::Rect;
 use crate::kurbo::Vec2;
-use crate::kurbo::{self, Affine, BezPath, Diagonal2, Join, Line, ParamCurve as _, PathSeg, Shape};
+use crate::kurbo::{
+    self, Affine, BezPath, Cap, Diagonal2, Join, Line, ParamCurve as _, PathSeg, Shape, Stroke,
+};
 use crate::peniko::FontData;
 use crate::renderer::{fill_glyph, render_cached_glyph, stroke_glyph};
 use crate::util::AffineExt;
@@ -55,6 +57,58 @@ pub struct Glyph {
     pub x: f32,
     /// Y-offset in run, relative to transform.
     pub y: f32,
+}
+
+/// The representation selected by glyph preparation, in rendering priority order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GlyphRepresentation {
+    /// A COLR paint graph, including its layers and clip box.
+    Colr,
+    /// A supported bitmap strike.
+    Bitmap,
+    /// A monochrome outline, including synthetic weight.
+    Outline,
+}
+
+/// Conservative geometric ink for one positioned glyph.
+///
+/// Bounds are in scene coordinates after the run and glyph transforms. They
+/// include hinting, variation coordinates, synthetic weight, and an optional
+/// stroke, but exclude device sampling/antialiasing, filters, and caller clips.
+/// They describe potential ink without inspecting paint transparency. Image
+/// representations follow the renderer's existing fill fallback for strokes.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum GlyphInkBounds {
+    /// Preparation succeeded and the glyph has no geometric ink (for example, a space).
+    Empty,
+    /// Preparation found drawable geometry.
+    Bounds {
+        /// The selected representation, rather than a font-wide capability.
+        representation: GlyphRepresentation,
+        /// A conservative axis-aligned bounding box in scene coordinates.
+        bounds: Rect,
+    },
+    /// No supported representation could be prepared. Callers should retain
+    /// their conservative fallback rather than interpreting this as empty ink.
+    Unavailable,
+}
+
+impl GlyphInkBounds {
+    fn from_rect(representation: GlyphRepresentation, bounds: Rect) -> Self {
+        if ![bounds.x0, bounds.y0, bounds.x1, bounds.y1]
+            .into_iter()
+            .all(f64::is_finite)
+        {
+            Self::Unavailable
+        } else if bounds.width() <= 0.0 || bounds.height() <= 0.0 {
+            Self::Empty
+        } else {
+            Self::Bounds {
+                representation,
+                bounds,
+            }
+        }
+    }
 }
 
 /// Synthetic embolden settings for a glyph run.
@@ -354,6 +408,117 @@ pub struct GlyphRunRenderer<'a, 'b, Glyphs: Iterator<Item = Glyph> + Clone> {
 }
 
 impl<'a, 'b, Glyphs: Iterator<Item = Glyph> + Clone> GlyphRunRenderer<'a, 'b, Glyphs> {
+    /// Measure each glyph using the same preparation, scaling, and representation
+    /// priority as rendering. The output has exactly one entry per input glyph.
+    ///
+    /// `stroke` adds conservative stroke ink to outline bounds. Its width is in
+    /// run-local pixels, before either transform. COLR and bitmap glyphs retain
+    /// their filled-image bounds, matching the current renderer. Measurement
+    /// populates the outline/hint caches but never allocates an atlas or renders
+    /// a COLR pixmap. Bitmap decoding follows the enabled decoder features.
+    pub fn ink_bounds(&mut self, stroke: Option<&Stroke>) -> Vec<GlyphInkBounds> {
+        let stroke_scale = self.stroke_adjustment();
+        let run = &self.prepared_run;
+        let font_ref = run.font.as_skrifa();
+        let mut cache =
+            OutlineCacheSession::new(self.outline_cache, VarLookupKey::new(run.normalized_coords));
+        let outlines = font_ref.outline_glyphs();
+        let colors = font_ref.color_glyphs();
+        let bitmaps = font_ref.bitmap_strikes();
+        let style = if stroke.is_some() {
+            Style::Stroke
+        } else {
+            Style::Fill
+        };
+        let scale = GlyphScaleProperties::new(
+            run.draw_props.font_size,
+            run.font_info.upem,
+            run.hinting_instance.is_some(),
+            style,
+        );
+        self.glyph_iterator
+            .clone()
+            .map(|glyph| {
+                let id = GlyphId::new(glyph.id);
+                if let Some(color) = colors.get(id) {
+                    let metrics = calculate_colr_metrics(
+                        run.draw_props.font_size,
+                        run.draw_props,
+                        glyph,
+                        &font_ref,
+                        &color,
+                        LocationRef::new(run.normalized_coords),
+                        &mut cache,
+                        run.font_info,
+                    );
+                    let area = Rect::new(
+                        0.0,
+                        0.0,
+                        metrics.scaled_bbox.width(),
+                        metrics.scaled_bbox.height(),
+                    );
+                    return GlyphInkBounds::from_rect(
+                        GlyphRepresentation::Colr,
+                        calculate_colr_transform(&metrics).transform_rect_bbox(area),
+                    );
+                }
+                if let Some((bitmap, pixmap)) =
+                    load_bitmap_glyph(&bitmaps, run.draw_props.font_size, id)
+                {
+                    let matrix = calculate_bitmap_transform(
+                        glyph,
+                        &pixmap,
+                        run.draw_props,
+                        run.draw_props.font_size,
+                        run.font_info.upem,
+                        &bitmap,
+                        &bitmaps,
+                    );
+                    let area = Rect::new(
+                        0.0,
+                        0.0,
+                        f64::from(pixmap.width()),
+                        f64::from(pixmap.height()),
+                    );
+                    return GlyphInkBounds::from_rect(
+                        GlyphRepresentation::Bitmap,
+                        matrix.transform_rect_bbox(area),
+                    );
+                }
+                let Some(outline) = outlines.get(id) else {
+                    return GlyphInkBounds::Unavailable;
+                };
+                let GlyphType::Outline(outline) = create_outline_glyph(
+                    glyph.id,
+                    run.font_info,
+                    &mut cache,
+                    scale.cache_size,
+                    scale.draw_scale,
+                    run.font_embolden,
+                    &outline,
+                    run.hinting_instance,
+                    run.normalized_coords,
+                ) else {
+                    unreachable!()
+                };
+                // A non-empty line can acquire area from a stroke. A space cannot.
+                if outline.path.segments().next().is_none() {
+                    return GlyphInkBounds::Empty;
+                }
+                let radius = stroke.map_or(0.0, |stroke| stroke_inflation(stroke) * stroke_scale);
+                let matrix =
+                    calculate_outline_transform(glyph, run.draw_props, run.hinting_instance);
+                let bounds = Affine::scale(outline.scale)
+                    .transform_rect_bbox(outline.bbox)
+                    .inflate(radius, radius);
+                GlyphInkBounds::from_rect(
+                    GlyphRepresentation::Outline,
+                    matrix.transform_rect_bbox(bounds),
+                )
+            })
+            .collect()
+    }
+
     /// Fills the glyphs with the current configuration.
     pub fn fill_glyphs(&mut self, renderer: &mut impl crate::GlyphRenderer) {
         self.draw_glyphs(Style::Fill, renderer);
@@ -547,20 +712,7 @@ impl<'a, 'b, Glyphs: Iterator<Item = Glyph> + Clone> GlyphRunRenderer<'a, 'b, Gl
             }
 
             // ── Bitmap Glyphs ────────────────────────────────────────────
-            let bitmap_data: Option<(skrifa::bitmap::BitmapGlyph<'_>, Pixmap)> = bitmaps
-                .glyph_for_size(Size::new(draw_props.font_size), glyph_id)
-                .and_then(|g| match g.data {
-                    #[cfg(feature = "png")]
-                    BitmapData::Png(data) => Pixmap::from_png(std::io::Cursor::new(data))
-                        .ok()
-                        .map(|d| (g, d)),
-                    #[cfg(not(feature = "png"))]
-                    BitmapData::Png(_) => None,
-                    // The others are not worth implementing for now (unless we can find a test case),
-                    // they should be very rare.
-                    BitmapData::Bgra(_) => None,
-                    BitmapData::Mask(_) => None,
-                });
+            let bitmap_data = load_bitmap_glyph(&bitmaps, draw_props.font_size, glyph_id);
 
             if let Some((bitmap_glyph, pixmap)) = bitmap_data {
                 // Bitmaps use the strike's own ppem, not the run's, because the
@@ -863,7 +1015,7 @@ impl<'a, 'b, Glyphs: Iterator<Item = Glyph> + Clone> GlyphRunRenderer<'a, 'b, Gl
 
 /// A builder for configuring and drawing glyphs.
 #[derive(Debug)]
-#[must_use = "Methods on the builder don't do anything until `render` is called."]
+#[must_use = "Configure the builder, then draw or measure glyphs."]
 pub struct GlyphRunBuilder<'a, B> {
     run: GlyphRun<'a>,
     backend: B,
@@ -920,6 +1072,24 @@ impl<'a, B> GlyphRunBuilder<'a, B> {
     pub fn normalized_coords(mut self, coords: &'a [NormalizedCoord]) -> Self {
         self.run.normalized_coords = bytemuck::cast_slice(coords);
         self
+    }
+
+    /// Measure glyph ink without drawing. A backend is not needed: use `()`
+    /// with [`Self::new`] when constructing a measurement-only builder.
+    ///
+    /// See [`GlyphRunRenderer::ink_bounds`] for coordinate and stroke semantics.
+    pub fn ink_bounds<Glyphs>(
+        self,
+        glyphs: Glyphs,
+        cache: &'a mut GlyphPrepCache,
+        stroke: Option<&Stroke>,
+    ) -> Vec<GlyphInkBounds>
+    where
+        Glyphs: Iterator<Item = Glyph> + Clone,
+    {
+        self.run
+            .build(glyphs, cache.as_mut(), AtlasCacher::Disabled)
+            .ink_bounds(stroke)
     }
 }
 
@@ -1192,10 +1362,39 @@ fn calculate_outline_transform(
     Affine::new(final_transform)
 }
 
-/// Create bitmap glyph data.
-///
-/// This wraps the pixmap in a `GlyphType::Bitmap` with its display area,
-/// without any positioning information.
+/// Select and decode the bitmap representation supported by the renderer.
+fn load_bitmap_glyph<'a>(
+    bitmaps: &BitmapStrikes<'a>,
+    size: f32,
+    id: GlyphId,
+) -> Option<(skrifa::bitmap::BitmapGlyph<'a>, Pixmap)> {
+    bitmaps
+        .glyph_for_size(Size::new(size), id)
+        .and_then(|glyph| match glyph.data {
+            #[cfg(feature = "png")]
+            BitmapData::Png(data) => Pixmap::from_png(std::io::Cursor::new(data))
+                .ok()
+                .map(|pixmap| (glyph, pixmap)),
+            #[cfg(not(feature = "png"))]
+            BitmapData::Png(_) => None,
+            BitmapData::Bgra(_) | BitmapData::Mask(_) => None,
+        })
+}
+
+// Match SkStrokeRec::GetInflationRadius: joins and square caps can extend
+// beyond half the width. Apply this before the glyph/run transforms.
+fn stroke_inflation(stroke: &Stroke) -> f64 {
+    let mut multiplier = 1.0_f64;
+    if stroke.join == Join::Miter {
+        multiplier = multiplier.max(stroke.miter_limit);
+    }
+    if stroke.start_cap == Cap::Square || stroke.end_cap == Cap::Square {
+        multiplier = multiplier.max(core::f64::consts::SQRT_2);
+    }
+    stroke.width.abs() * 0.5 * multiplier
+}
+
+/// Wrap a decoded bitmap with its pixel-space display area.
 fn create_bitmap_glyph(pixmap: Pixmap) -> GlyphType<'static> {
     // Scale factor already accounts for ppem, so we can just draw in the size of the
     // actual image
@@ -2499,6 +2698,108 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn measured_outline_ink_tracks_positions_synthesis_stroke_and_transforms() {
+        let font = test_font(TestGlyphKind::Outline);
+        let mut glyph = test_glyph(&font, TestGlyphKind::Outline);
+        glyph.x = 17.0;
+        glyph.y = 43.0;
+        let mut cache = GlyphPrepCache::default();
+        for transform in [Affine::IDENTITY, Affine::scale(2.0), Affine::skew(0.3, 0.2)] {
+            let stroke = Stroke::new(6.0)
+                .with_join(Join::Miter)
+                .with_miter_limit(4.0);
+            let measured = GlyphRunBuilder::new(font.clone(), transform, Affine::IDENTITY, ())
+                .font_size(20.0)
+                .hint(false)
+                .font_embolden(FontEmbolden::new(Diagonal2::new(0.3, 0.3)))
+                .ink_bounds(core::iter::once(glyph), &mut cache, Some(&stroke));
+            let GlyphInkBounds::Bounds {
+                representation,
+                bounds,
+            } = measured[0]
+            else {
+                panic!("missing outline ink")
+            };
+            assert_eq!(representation, GlyphRepresentation::Outline);
+            let local = expanded_bounds(&font, 20.0, Affine::IDENTITY, Style::Stroke, 0.3);
+            let expected = (transform * Affine::translate((17.0, 43.0)))
+                .transform_rect_bbox(local.inflate(12.0, 12.0));
+            for (a, b) in [bounds.x0, bounds.y0, bounds.x1, bounds.y1]
+                .into_iter()
+                .zip([expected.x0, expected.y0, expected.x1, expected.y1])
+            {
+                // Absorbed scales draw the outline at another TrueType size;
+                // scaler quantization stays within the expansion tolerance.
+                let [a0, b0, c0, d0, _, _] = transform.as_coeffs();
+                let tolerance = FontEmbolden::default().tolerance
+                    * (a0.abs() + c0.abs()).max(b0.abs() + d0.abs());
+                assert!((a - b).abs() < tolerance, "{bounds:?} != {expected:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn measurement_distinguishes_empty_ink_from_unavailable_geometry() {
+        let font = test_font(TestGlyphKind::Outline);
+        let glyphs = [
+            test_glyph(&font, TestGlyphKind::Outline),
+            Glyph {
+                id: font.as_skrifa().charmap().map(' ').unwrap().to_u32(),
+                ..Glyph::default()
+            },
+            Glyph {
+                id: u32::MAX,
+                ..Glyph::default()
+            },
+        ];
+        let mut cache = GlyphPrepCache::default();
+        let measured = GlyphRunBuilder::new(font, Affine::IDENTITY, Affine::IDENTITY, ())
+            .hint(false)
+            .ink_bounds(glyphs.into_iter(), &mut cache, Some(&Stroke::new(100.0)));
+        assert_eq!(measured.len(), 3);
+        assert!(matches!(
+            measured[0],
+            GlyphInkBounds::Bounds {
+                representation: GlyphRepresentation::Outline,
+                ..
+            }
+        ));
+        assert_eq!(measured[1], GlyphInkBounds::Empty);
+        assert_eq!(measured[2], GlyphInkBounds::Unavailable);
+    }
+
+    fn measured_image_ink(kind: TestGlyphKind, representation: GlyphRepresentation) {
+        let font = test_font(kind);
+        let glyph = test_glyph(&font, kind);
+        let mut cache = GlyphPrepCache::default();
+        for transform in [Affine::IDENTITY, Affine::scale(2.0), Affine::skew(0.3, 0.2)] {
+            let mut measure = |stroke: Option<&Stroke>| {
+                GlyphRunBuilder::new(font.clone(), transform, Affine::IDENTITY, ())
+                    .font_size(20.0)
+                    .hint(false)
+                    .ink_bounds(core::iter::once(glyph), &mut cache, stroke)[0]
+            };
+            let fill = measure(None);
+            assert!(
+                matches!(fill, GlyphInkBounds::Bounds { representation: actual, .. } if actual == representation)
+            );
+            // Measuring does not introduce a new color-glyph stroke policy.
+            assert_eq!(measure(Some(&Stroke::new(100.0))), fill);
+        }
+    }
+
+    #[test]
+    fn measurement_uses_colr_layers_instead_of_the_base_outline() {
+        measured_image_ink(TestGlyphKind::Colr, GlyphRepresentation::Colr);
+    }
+
+    #[cfg(feature = "png")]
+    #[test]
+    fn measurement_uses_the_supported_bitmap_strike() {
+        measured_image_ink(TestGlyphKind::Bitmap, GlyphRepresentation::Bitmap);
     }
 
     #[test]
