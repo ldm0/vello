@@ -60,7 +60,8 @@ pub struct Glyph {
 /// Synthetic embolden settings for a glyph run.
 #[derive(Clone, Copy, Debug)]
 pub struct FontEmbolden {
-    /// Synthetic embolden amount.
+    /// Synthetic embolden amount in the glyph run's local pixel coordinates,
+    /// before the run and glyph transforms are applied.
     pub amount: Diagonal2,
     /// Join style used when expanding outlines.
     pub join: Join,
@@ -95,6 +96,18 @@ impl FontEmbolden {
     pub fn with_tolerance(mut self, tolerance: f64) -> Self {
         self.tolerance = tolerance;
         self
+    }
+
+    /// Convert expansion distances when moving between run, draw and cache units.
+    fn scaled(self, scale: f64) -> Self {
+        if self.amount == Diagonal2::new(0.0, 0.0) {
+            return self;
+        }
+        Self {
+            amount: Diagonal2::new(self.amount.xx * scale, self.amount.yy * scale),
+            tolerance: self.tolerance * scale.abs(),
+            ..self
+        }
     }
 }
 
@@ -774,7 +787,7 @@ impl<'a, 'b, Glyphs: Iterator<Item = Glyph> + Clone> GlyphRunRenderer<'a, 'b, Gl
                 glyph.id,
                 font_info,
                 scale_props.cache_size,
-                font_embolden,
+                font_embolden.scaled(scale_props.draw_scale.recip()),
                 var_key,
                 &outline,
                 hinting_instance,
@@ -1112,7 +1125,7 @@ fn create_outline_glyph<'a>(
         glyph_id,
         font_info,
         size,
-        embolden,
+        embolden.scaled(scale.recip()),
         VarLookupKey::new(normalized_coords),
         outline_glyph,
         hinting_instance,
@@ -1638,7 +1651,11 @@ fn prepare_glyph_run<'a>(run: GlyphRun<'a>, hint_cache: &'a mut HintCache) -> Pr
         font: run.font,
         font_info,
         run_size: run.font_size,
-        font_embolden: run.font_embolden,
+        // Uniform scale may have moved from the transform into the draw size.
+        // Expansion distances follow that scale, including atlas cache keys.
+        font_embolden: run
+            .font_embolden
+            .scaled(f64::from(draw_font_size / run.font_size)),
         glyph_transform: run.glyph_transform,
         draw_props: DrawProps {
             positioning_transform: run
@@ -2395,6 +2412,121 @@ mod tests {
     #[test]
     fn outline_glyph_is_cached_when_atlas_cache_is_enabled() {
         ensure_cache(TestGlyphKind::Outline, Style::Fill);
+    }
+
+    fn expanded_bounds(
+        font: &FontData,
+        size: f32,
+        transform: Affine,
+        style: Style,
+        amount: f64,
+    ) -> Rect {
+        let mut hints = HintCache::default();
+        let mut cache = OutlineCache::default();
+        let prepared = prepare_glyph_run(
+            GlyphRun {
+                font: font.clone(),
+                font_size: size,
+                font_embolden: FontEmbolden::new(Diagonal2::new(amount, amount)),
+                transform,
+                scene_paint_transform: transform,
+                glyph_transform: None,
+                normalized_coords: &[],
+                hint: false,
+            },
+            &mut hints,
+        );
+        let font_ref = font.as_skrifa();
+        let glyph = test_glyph(font, TestGlyphKind::Outline);
+        let outline = font_ref
+            .outline_glyphs()
+            .get(GlyphId::new(glyph.id))
+            .unwrap();
+        let props = GlyphScaleProperties::new(
+            prepared.draw_props.font_size,
+            prepared.font_info.upem,
+            false,
+            style,
+        );
+        let mut session = OutlineCacheSession::new(&mut cache, VarLookupKey::new(&[]));
+        let GlyphType::Outline(outline) = create_outline_glyph(
+            glyph.id,
+            prepared.font_info,
+            &mut session,
+            props.cache_size,
+            props.draw_scale,
+            prepared.font_embolden,
+            &outline,
+            None,
+            &[],
+        ) else {
+            unreachable!()
+        };
+        let matrix =
+            calculate_outline_transform(glyph, prepared.draw_props, None).pre_scale(outline.scale);
+        matrix.transform_rect_bbox(outline.bbox)
+    }
+
+    #[test]
+    fn synthetic_bold_preserves_run_pixel_distances_for_fill_and_stroke() {
+        let font = test_font(TestGlyphKind::Outline);
+        for size in [12.0, 20.0, 50.0] {
+            let plain = expanded_bounds(&font, size, Affine::IDENTITY, Style::Fill, 0.0);
+            for transform in [
+                Affine::IDENTITY,
+                Affine::scale(2.0),
+                Affine::scale(0.5),
+                Affine::skew(0.3, 0.0),
+            ] {
+                let expected = transform.transform_rect_bbox(plain.inflate(0.3, 0.3));
+                // Roboto's stems are not exact rectangles. Expansion and
+                // outline scaling may move their extrema within the configured
+                // path approximation tolerance, expressed in run pixels.
+                let [a, b, c, d, _, _] = transform.as_coeffs();
+                let tolerance =
+                    FontEmbolden::default().tolerance * (a.abs() + c.abs()).max(b.abs() + d.abs());
+                for style in [Style::Fill, Style::Stroke] {
+                    let actual = expanded_bounds(&font, size, transform, style, 0.3);
+                    for (a, b) in [actual.x0, actual.y0, actual.x1, actual.y1]
+                        .into_iter()
+                        .zip([expected.x0, expected.y0, expected.x1, expected.y1])
+                    {
+                        assert!(
+                            (a - b).abs() < tolerance,
+                            "size={size}, transform={transform:?}, expected={expected:?}, actual={actual:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn absorbed_scale_keeps_different_synthetic_weights_out_of_the_same_atlas_slot() {
+        let font = test_font(TestGlyphKind::Outline);
+        let glyph = test_glyph(&font, TestGlyphKind::Outline);
+        let mut resources = TestResources::default();
+        for (size, scale) in [(20.0, 2.0), (40.0, 1.0), (20.0, 2.0)] {
+            let transform = Affine::scale(scale);
+            let mut run = GlyphRun {
+                font: font.clone(),
+                font_size: size,
+                font_embolden: FontEmbolden::new(Diagonal2::new(0.3, 0.3)),
+                transform,
+                scene_paint_transform: transform,
+                glyph_transform: None,
+                normalized_coords: &[],
+                hint: false,
+            }
+            .build(
+                core::iter::once(glyph),
+                resources.prep_cache.as_mut(),
+                AtlasCacher::Enabled(&mut resources.glyph_atlas, &mut resources.image_cache),
+            );
+            run.fill_glyphs(&mut resources.renderer);
+        }
+        assert_eq!(resources.glyph_atlas.len(), 2);
+        assert_eq!(resources.glyph_atlas.cache_hits(), 1);
     }
 
     #[test]
