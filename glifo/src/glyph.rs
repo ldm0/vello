@@ -501,8 +501,9 @@ impl<'a, 'b, Glyphs: Iterator<Item = Glyph> + Clone> GlyphRunRenderer<'a, 'b, Gl
                 ) else {
                     unreachable!()
                 };
-                // A non-empty line can acquire area from a stroke. A space cannot.
-                if outline.path.segments().next().is_none() {
+                // Even degenerate contours can acquire area from a stroke.
+                // Only a path with no commands is certainly empty (a space).
+                if outline.path.is_empty() {
                     return GlyphInkBounds::Empty;
                 }
                 let radius = stroke.map_or(0.0, |stroke| stroke_inflation(stroke) * stroke_scale);
